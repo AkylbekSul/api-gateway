@@ -12,7 +12,6 @@ import (
 
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"github.com/akylbek/payment-system/api-gateway/internal/api"
@@ -51,16 +50,8 @@ func main() {
 		Addr: cfg.RedisURL,
 	})
 
-	// Connect to Kafka
-	kafkaWriter := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.KafkaBrokers),
-		Topic:    "payment.created",
-		Balancer: &kafka.LeastBytes{},
-	}
-	defer kafkaWriter.Close()
-
 	// Setup router with all routes
-	router := api.NewRouter(paymentRepo, redisClient, kafkaWriter)
+	router := api.NewRouter(paymentRepo, redisClient, cfg.OrchestratorURL)
 
 	// Setup HTTP server
 	srv := &http.Server{

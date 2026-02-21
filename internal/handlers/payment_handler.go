@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -10,7 +11,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
@@ -20,16 +20,20 @@ import (
 )
 
 type PaymentHandler struct {
-	repo        interfaces.PaymentRepository
-	redisClient *redis.Client
-	kafkaWriter *kafka.Writer
+	repo            interfaces.PaymentRepository
+	redisClient     *redis.Client
+	orchestratorURL string
+	httpClient      *http.Client
 }
 
-func NewPaymentHandler(repo interfaces.PaymentRepository, redisClient *redis.Client, kafkaWriter *kafka.Writer) *PaymentHandler {
+func NewPaymentHandler(repo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorURL string) *PaymentHandler {
 	return &PaymentHandler{
-		repo:        repo,
-		redisClient: redisClient,
-		kafkaWriter: kafkaWriter,
+		repo:            repo,
+		redisClient:     redisClient,
+		orchestratorURL: orchestratorURL,
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
 	}
 }
 
@@ -75,10 +79,22 @@ func (h *PaymentHandler) CreatePayment(c *gin.Context) {
 	}
 
 	// Cache in Redis
-	paymentJSON, _ := json.Marshal(payment)
-	h.redisClient.Set(ctx, fmt.Sprintf("idempotency:%s", idempotencyKey), paymentJSON, 24*time.Hour)
+	paymentJSON, err := json.Marshal(payment)
+	if err != nil {
+		telemetry.Logger.Error("Failed to marshal payment", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+		return
+	}
 
-	// Publish to Kafka
+	if err := h.redisClient.Set(ctx, fmt.Sprintf("idempotency:%s", idempotencyKey), paymentJSON, 24*time.Hour).Err(); err != nil {
+		telemetry.Logger.Warn("Failed to cache payment in Redis",
+			zap.String("payment_id", payment.ID),
+			zap.Error(err),
+		)
+		// Redis кэш не критичен, продолжаем
+	}
+
+	// Send to Payment Orchestrator via HTTP
 	event := map[string]interface{}{
 		"payment_id":  payment.ID,
 		"amount":      payment.Amount,
@@ -88,16 +104,43 @@ func (h *PaymentHandler) CreatePayment(c *gin.Context) {
 		"status":      payment.Status,
 		"created_at":  payment.CreatedAt,
 	}
-	eventJSON, _ := json.Marshal(event)
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		telemetry.Logger.Error("Failed to marshal event", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+		return
+	}
 
-	if err := h.kafkaWriter.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(payment.ID),
-		Value: eventJSON,
-	}); err != nil {
-		telemetry.Logger.Error("Failed to publish payment event to Kafka",
+	orchestratorReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		h.orchestratorURL+"/payments/process", bytes.NewReader(eventJSON))
+	if err != nil {
+		telemetry.Logger.Error("Failed to create orchestrator request",
 			zap.String("payment_id", payment.ID),
 			zap.Error(err),
 		)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
+		return
+	}
+
+	orchestratorReq.Header.Set("Content-Type", "application/json")
+	resp, err := h.httpClient.Do(orchestratorReq)
+	if err != nil {
+		telemetry.Logger.Error("Failed to send payment to orchestrator",
+			zap.String("payment_id", payment.ID),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		telemetry.Logger.Error("Orchestrator returned error",
+			zap.String("payment_id", payment.ID),
+			zap.Int("status_code", resp.StatusCode),
+		)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
+		return
 	}
 
 	telemetry.Logger.Info("Payment created successfully",
