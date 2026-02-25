@@ -6,7 +6,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
 
 	"github.com/akylbek/payment-system/api-gateway/internal/handlers"
 	"github.com/akylbek/payment-system/api-gateway/internal/interfaces"
@@ -14,7 +13,7 @@ import (
 	"github.com/akylbek/payment-system/api-gateway/internal/telemetry"
 )
 
-func NewRouter(paymentRepo interfaces.PaymentRepository, redisClient *redis.Client, kafkaWriter *kafka.Writer) *gin.Engine {
+func NewRouter(paymentRepo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorURL string) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -29,7 +28,7 @@ func NewRouter(paymentRepo interfaces.PaymentRepository, redisClient *redis.Clie
 	})
 
 	// Payment routes
-	paymentHandler := handlers.NewPaymentHandler(paymentRepo, redisClient, kafkaWriter)
+	paymentHandler := handlers.NewPaymentHandler(paymentRepo, redisClient, orchestratorURL)
 	payments := r.Group("/payments")
 	{
 		payments.POST("", middleware.IdempotencyMiddleware(redisClient, paymentRepo), paymentHandler.CreatePayment)
