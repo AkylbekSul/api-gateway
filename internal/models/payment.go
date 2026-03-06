@@ -14,8 +14,8 @@ type Payment struct {
 }
 
 type CreatePaymentRequest struct {
-	Amount     float64 `json:"amount" binding:"required"`
-	Currency   string  `json:"currency" binding:"required"`
-	CustomerID string  `json:"customer_id" binding:"required"`
-	MerchantID string  `json:"merchant_id" binding:"required"`
+	Amount     float64 `json:"amount"`
+	Currency   string  `json:"currency"`
+	CustomerID string  `json:"customer_id"`
+	MerchantID string  `json:"merchant_id"`
 }

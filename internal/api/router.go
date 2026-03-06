@@ -1,9 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 
-	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
@@ -14,28 +14,31 @@ import (
 	paymentpb "github.com/akylbek/payment-system/proto/payment"
 )
 
-func NewRouter(paymentRepo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorClient paymentpb.PaymentOrchestratorClient) *gin.Engine {
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	r.Use(gin.Recovery())
-	r.Use(telemetry.TracingMiddleware())
+func NewRouter(paymentRepo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorClient paymentpb.PaymentOrchestratorClient) http.Handler {
+	mux := http.NewServeMux()
 
 	// Prometheus metrics
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	// Health check
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "api-gateway"})
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "api-gateway"})
 	})
 
 	// Payment routes
 	paymentHandler := handlers.NewPaymentHandler(paymentRepo, redisClient, orchestratorClient)
-	payments := r.Group("/payments")
-	{
-		payments.POST("", middleware.IdempotencyMiddleware(redisClient, paymentRepo), paymentHandler.CreatePayment)
-		payments.GET("/:id", paymentHandler.GetPayment)
-		payments.POST("/:id/confirm", paymentHandler.ConfirmPayment)
-	}
 
-	return r
+	// POST /payments with idempotency middleware
+	idempotency := middleware.IdempotencyMiddleware(redisClient, paymentRepo)
+	mux.Handle("POST /payments", idempotency(http.HandlerFunc(paymentHandler.CreatePayment)))
+	mux.HandleFunc("GET /payments/{id}", paymentHandler.GetPayment)
+	mux.HandleFunc("POST /payments/{id}/confirm", paymentHandler.ConfirmPayment)
+
+	// Apply global middleware
+	var handler http.Handler = mux
+	handler = telemetry.TracingMiddleware(handler)
+	handler = telemetry.RecoveryMiddleware(handler)
+
+	return handler
 }

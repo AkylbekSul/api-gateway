@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel/trace"
@@ -20,9 +19,9 @@ import (
 )
 
 type PaymentHandler struct {
-	repo                interfaces.PaymentRepository
-	redisClient         *redis.Client
-	orchestratorClient  paymentpb.PaymentOrchestratorClient
+	repo               interfaces.PaymentRepository
+	redisClient        *redis.Client
+	orchestratorClient paymentpb.PaymentOrchestratorClient
 }
 
 func NewPaymentHandler(repo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorClient paymentpb.PaymentOrchestratorClient) *PaymentHandler {
@@ -33,18 +32,30 @@ func NewPaymentHandler(repo interfaces.PaymentRepository, redisClient *redis.Cli
 	}
 }
 
-func (h *PaymentHandler) CreatePayment(c *gin.Context) {
-	ctx := c.Request.Context()
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func (h *PaymentHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	span := trace.SpanFromContext(ctx)
 
 	var req models.CreatePaymentRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		telemetry.Logger.Warn("Invalid payment request", zap.Error(err))
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
-	idempotencyKey := c.GetString("idempotency_key")
+	// Validate required fields
+	if req.Amount == 0 || req.Currency == "" || req.CustomerID == "" || req.MerchantID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "amount, currency, customer_id, and merchant_id are required"})
+		return
+	}
+
+	idempotencyKey, _ := ctx.Value(idempotencyKeyCtx).(string)
 
 	payment := models.Payment{
 		ID:             uuid.New().String(),
@@ -70,7 +81,7 @@ func (h *PaymentHandler) CreatePayment(c *gin.Context) {
 			zap.String("payment_id", payment.ID),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create payment"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create payment"})
 		return
 	}
 
@@ -78,7 +89,7 @@ func (h *PaymentHandler) CreatePayment(c *gin.Context) {
 	paymentJSON, err := json.Marshal(payment)
 	if err != nil {
 		telemetry.Logger.Error("Failed to marshal payment", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal server error"})
 		return
 	}
 
@@ -87,7 +98,7 @@ func (h *PaymentHandler) CreatePayment(c *gin.Context) {
 			zap.String("payment_id", payment.ID),
 			zap.Error(err),
 		)
-		// Redis кэш не критичен, продолжаем
+		// Redis cache is not critical, continue
 	}
 
 	// Send to Payment Orchestrator via gRPC
@@ -105,7 +116,7 @@ func (h *PaymentHandler) CreatePayment(c *gin.Context) {
 			zap.String("payment_id", payment.ID),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to process payment"})
 		return
 	}
 
@@ -113,32 +124,37 @@ func (h *PaymentHandler) CreatePayment(c *gin.Context) {
 		zap.String("payment_id", payment.ID),
 	)
 
-	c.JSON(http.StatusCreated, payment)
+	writeJSON(w, http.StatusCreated, payment)
 }
 
-func (h *PaymentHandler) GetPayment(c *gin.Context) {
-	id := c.Param("id")
+func (h *PaymentHandler) GetPayment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 
-	payment, err := h.repo.GetByID(c.Request.Context(), id)
+	payment, err := h.repo.GetByID(r.Context(), id)
 	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Payment not found"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Payment not found"})
 		return
 	}
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch payment"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to fetch payment"})
 		return
 	}
 
-	c.JSON(http.StatusOK, payment)
+	writeJSON(w, http.StatusOK, payment)
 }
 
-func (h *PaymentHandler) ConfirmPayment(c *gin.Context) {
-	id := c.Param("id")
+func (h *PaymentHandler) ConfirmPayment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 
-	if err := h.repo.UpdateStatus(c.Request.Context(), id, "CONFIRMED"); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to confirm payment"})
+	if err := h.repo.UpdateStatus(r.Context(), id, "CONFIRMED"); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to confirm payment"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "confirmed", "payment_id": id})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "confirmed", "payment_id": id})
 }
+
+// idempotencyKeyCtx is the context key for the idempotency key
+type contextKey string
+
+const idempotencyKeyCtx contextKey = "idempotency_key"
