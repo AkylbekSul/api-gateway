@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -17,23 +16,20 @@ import (
 	"github.com/akylbek/payment-system/api-gateway/internal/interfaces"
 	"github.com/akylbek/payment-system/api-gateway/internal/models"
 	"github.com/akylbek/payment-system/api-gateway/internal/telemetry"
+	paymentpb "github.com/akylbek/payment-system/proto/payment"
 )
 
 type PaymentHandler struct {
-	repo            interfaces.PaymentRepository
-	redisClient     *redis.Client
-	orchestratorURL string
-	httpClient      *http.Client
+	repo                interfaces.PaymentRepository
+	redisClient         *redis.Client
+	orchestratorClient  paymentpb.PaymentOrchestratorClient
 }
 
-func NewPaymentHandler(repo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorURL string) *PaymentHandler {
+func NewPaymentHandler(repo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorClient paymentpb.PaymentOrchestratorClient) *PaymentHandler {
 	return &PaymentHandler{
-		repo:            repo,
-		redisClient:     redisClient,
-		orchestratorURL: orchestratorURL,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		repo:               repo,
+		redisClient:        redisClient,
+		orchestratorClient: orchestratorClient,
 	}
 }
 
@@ -94,50 +90,20 @@ func (h *PaymentHandler) CreatePayment(c *gin.Context) {
 		// Redis кэш не критичен, продолжаем
 	}
 
-	// Send to Payment Orchestrator via HTTP
-	event := map[string]interface{}{
-		"payment_id":  payment.ID,
-		"amount":      payment.Amount,
-		"currency":    payment.Currency,
-		"customer_id": payment.CustomerID,
-		"merchant_id": payment.MerchantID,
-		"status":      payment.Status,
-		"created_at":  payment.CreatedAt,
-	}
-	eventJSON, err := json.Marshal(event)
+	// Send to Payment Orchestrator via gRPC
+	_, err = h.orchestratorClient.ProcessPayment(ctx, &paymentpb.ProcessPaymentRequest{
+		PaymentId:  payment.ID,
+		Amount:     payment.Amount,
+		Currency:   payment.Currency,
+		CustomerId: payment.CustomerID,
+		MerchantId: payment.MerchantID,
+		Status:     payment.Status,
+		CreatedAt:  payment.CreatedAt.Format(time.RFC3339),
+	})
 	if err != nil {
-		telemetry.Logger.Error("Failed to marshal event", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
-		return
-	}
-
-	orchestratorReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		h.orchestratorURL+"/payments/process", bytes.NewReader(eventJSON))
-	if err != nil {
-		telemetry.Logger.Error("Failed to create orchestrator request",
+		telemetry.Logger.Error("Failed to send payment to orchestrator via gRPC",
 			zap.String("payment_id", payment.ID),
 			zap.Error(err),
-		)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
-		return
-	}
-
-	orchestratorReq.Header.Set("Content-Type", "application/json")
-	resp, err := h.httpClient.Do(orchestratorReq)
-	if err != nil {
-		telemetry.Logger.Error("Failed to send payment to orchestrator",
-			zap.String("payment_id", payment.ID),
-			zap.Error(err),
-		)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		telemetry.Logger.Error("Orchestrator returned error",
-			zap.String("payment_id", payment.ID),
-			zap.Int("status_code", resp.StatusCode),
 		)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
 		return

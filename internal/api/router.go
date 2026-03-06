@@ -11,9 +11,10 @@ import (
 	"github.com/akylbek/payment-system/api-gateway/internal/interfaces"
 	"github.com/akylbek/payment-system/api-gateway/internal/middleware"
 	"github.com/akylbek/payment-system/api-gateway/internal/telemetry"
+	paymentpb "github.com/akylbek/payment-system/proto/payment"
 )
 
-func NewRouter(paymentRepo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorURL string) *gin.Engine {
+func NewRouter(paymentRepo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorClient paymentpb.PaymentOrchestratorClient) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -28,7 +29,7 @@ func NewRouter(paymentRepo interfaces.PaymentRepository, redisClient *redis.Clie
 	})
 
 	// Payment routes
-	paymentHandler := handlers.NewPaymentHandler(paymentRepo, redisClient, orchestratorURL)
+	paymentHandler := handlers.NewPaymentHandler(paymentRepo, redisClient, orchestratorClient)
 	payments := r.Group("/payments")
 	{
 		payments.POST("", middleware.IdempotencyMiddleware(redisClient, paymentRepo), paymentHandler.CreatePayment)

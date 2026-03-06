@@ -13,11 +13,14 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/akylbek/payment-system/api-gateway/internal/api"
 	"github.com/akylbek/payment-system/api-gateway/internal/config"
 	"github.com/akylbek/payment-system/api-gateway/internal/repository"
 	"github.com/akylbek/payment-system/api-gateway/internal/telemetry"
+	paymentpb "github.com/akylbek/payment-system/proto/payment"
 )
 
 func main() {
@@ -39,6 +42,11 @@ func main() {
 	}
 	defer db.Close()
 
+	// Configure connection pool for high concurrency
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
 	// Initialize repository
 	paymentRepo := repository.NewPaymentRepository(db)
 	if err := paymentRepo.InitDB(); err != nil {
@@ -47,11 +55,22 @@ func main() {
 
 	// Connect to Redis
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: cfg.RedisURL,
+		Addr:     cfg.RedisURL,
+		PoolSize: 100,
 	})
 
+	// Connect to Payment Orchestrator via gRPC
+	orchestratorConn, err := grpc.NewClient(cfg.OrchestratorGRPCAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		telemetry.Logger.Fatal("Failed to connect to orchestrator via gRPC", zap.Error(err))
+	}
+	defer orchestratorConn.Close()
+	orchestratorClient := paymentpb.NewPaymentOrchestratorClient(orchestratorConn)
+
 	// Setup router with all routes
-	router := api.NewRouter(paymentRepo, redisClient, cfg.OrchestratorURL)
+	router := api.NewRouter(paymentRepo, redisClient, orchestratorClient)
 
 	// Setup HTTP server
 	srv := &http.Server{
