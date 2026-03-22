@@ -1,16 +1,6 @@
 # API Gateway Service
 
-The API Gateway serves as the main entry point for all payment-related requests in the distributed payment system. It handles client requests, provides idempotency guarantees, and publishes payment events to downstream services.
-
-## Overview
-
-The API Gateway is responsible for:
-- Receiving and validating payment creation requests
-- Ensuring idempotent payment processing using Redis
-- Storing payment records in PostgreSQL
-- Publishing payment events to Kafka for processing by other services
-- Providing RESTful APIs for payment management
-- Distributed tracing and observability with OpenTelemetry
+The API Gateway is the main entry point for all payment-related requests in the distributed payment system. It receives client requests, validates them, ensures idempotent processing, persists payment records, and coordinates with downstream services via gRPC.
 
 ## Architecture
 
@@ -19,38 +9,60 @@ Client Request → API Gateway → PostgreSQL (persistence)
                      ↓
                    Redis (idempotency cache)
                      ↓
-                   Kafka (event publishing)
+                   Payment Orchestrator (gRPC + Circuit Breaker)
+```
+
+### Request Flow
+
+```
+Client Request
+    ↓
+Tracing Middleware (creates span, propagates trace context)
+    ↓
+Idempotency Middleware (checks Redis cache)
+    ├─ Cache Hit → Return cached response
+    └─ Cache Miss → Continue
+    ↓
+Payment Handler
+    ├─ Validate request
+    ├─ Generate UUID
+    ├─ Save to PostgreSQL (status: NEW)
+    ├─ Cache in Redis (24h TTL)
+    ├─ Send to Orchestrator via gRPC (circuit breaker protected)
+    └─ Return 201 Created
 ```
 
 ## Technology Stack
 
-- **Language**: Go 1.21+
+- **Language**: Go 1.22
 - **Web Framework**: Gin
 - **Database**: PostgreSQL
 - **Cache**: Redis
-- **Message Broker**: Kafka
+- **Service Communication**: gRPC (Payment Orchestrator)
+- **Resilience**: Sony gobreaker (circuit breaker) + retry with exponential backoff
 - **Observability**: OpenTelemetry + Jaeger
-- **Logging**: Zap (Uber)
+- **Logging**: Zap
+- **Metrics**: Prometheus
 
 ## Configuration
 
-The service uses environment variables for configuration:
+Environment variables:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PORT` | HTTP server port | `8081` |
 | `DATABASE_URL` | PostgreSQL connection string | Required |
 | `REDIS_URL` | Redis server address | Required |
-| `KAFKA_BROKERS` | Kafka broker addresses | Required |
-| `JAEGER_ENDPOINT` | Jaeger collector endpoint | Optional |
+| `ORCHESTRATOR_GRPC_ADDR` | gRPC endpoint for Payment Orchestrator | `localhost:50051` |
+| `JAEGER_ENDPOINT` | Jaeger OTLP HTTP collector | `jaeger:4318` |
 
 ## API Endpoints
 
 ### Create Payment
 ```http
-POST /api/v1/payments
+POST /payments
 Content-Type: application/json
-X-Idempotency-Key: <unique-key>
+Idempotency-Key: <unique-key>
 
 {
   "amount": 100.50,
@@ -60,7 +72,7 @@ X-Idempotency-Key: <unique-key>
 }
 ```
 
-**Response**: `201 Created`
+**Response** `201 Created`:
 ```json
 {
   "id": "payment-uuid",
@@ -76,31 +88,12 @@ X-Idempotency-Key: <unique-key>
 
 ### Get Payment
 ```http
-GET /api/v1/payments/:id
-```
-
-**Response**: `200 OK`
-```json
-{
-  "id": "payment-uuid",
-  "amount": 100.50,
-  "currency": "USD",
-  "status": "PROCESSED",
-  "created_at": "2026-02-13T10:00:00Z"
-}
+GET /payments/:id
 ```
 
 ### Confirm Payment
 ```http
-POST /api/v1/payments/:id/confirm
-```
-
-**Response**: `200 OK`
-```json
-{
-  "status": "confirmed",
-  "payment_id": "payment-uuid"
-}
+POST /payments/:id/confirm
 ```
 
 ### Health Check
@@ -116,178 +109,124 @@ GET /metrics
 ## Key Features
 
 ### Idempotency
-The API Gateway ensures idempotent payment creation using the `X-Idempotency-Key` header. This prevents duplicate payments if the same request is sent multiple times:
-- Middleware intercepts requests and checks Redis for existing responses
-- Cached responses are returned immediately
-- New requests are processed and cached for 24 hours
 
-### Event Publishing
-After successfully creating a payment, the gateway publishes a `payment.created` event to Kafka:
-```json
-{
-  "payment_id": "payment-uuid",
-  "amount": 100.50,
-  "currency": "USD",
-  "customer_id": "customer-123",
-  "merchant_id": "merchant-456",
-  "status": "NEW",
-  "created_at": "2026-02-13T10:00:00Z"
-}
-```
+The `Idempotency-Key` header is required for payment creation. The middleware checks Redis for an existing cached response:
+- **Cache hit**: returns the cached response immediately
+- **Cache miss**: processes the request and caches the response for 24 hours
+
+### Circuit Breaker
+
+The gRPC client to the Payment Orchestrator is wrapped with a circuit breaker (Sony gobreaker) to prevent cascading failures:
+
+| Parameter | Value |
+|-----------|-------|
+| Failure threshold | 60% failure ratio on 5+ requests |
+| Open → Half-Open timeout | 15 seconds |
+| Max requests in Half-Open | 3 |
+| Evaluation interval | 10 seconds |
+
+**States**:
+- **Closed** (normal): requests pass through, failures are tracked
+- **Open** (failure detected): requests rejected immediately with `503 Service Unavailable`
+- **Half-Open** (recovery): up to 3 test requests allowed to check if the service recovered
+
+The gRPC client also includes retry logic (max 1 retry, exponential backoff starting at 100ms) for transient errors (`Unavailable`, `DeadlineExceeded`, `ResourceExhausted`).
 
 ### Distributed Tracing
-All requests are traced using OpenTelemetry with trace context propagation:
-- Automatic span creation for incoming requests
-- Trace IDs logged for correlation
-- Integration with Jaeger for visualization
+
+OpenTelemetry integration with Jaeger:
+- Automatic span creation for HTTP requests
+- Trace ID in structured logs and `X-Trace-ID` response header
+- Trace context propagation across services
+
+## Database Schema
+
+The main `payments` table:
+
+```sql
+CREATE TABLE payments (
+    id VARCHAR(255) PRIMARY KEY,
+    amount DECIMAL(15,2) NOT NULL,
+    currency VARCHAR(3) NOT NULL DEFAULT 'USD',
+    customer_id VARCHAR(255) NOT NULL,
+    merchant_id VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'NEW',
+    idempotency_key VARCHAR(255) UNIQUE,
+    payment_method VARCHAR(50),
+    description TEXT,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Additional tables: `customers`, `merchants`, `schema_migrations`. See [migrations/001_api_gateway_schema.sql](migrations/001_api_gateway_schema.sql) for the full schema.
 
 ## Running the Service
 
 ### Local Development
 
-1. Set up environment variables:
 ```bash
 export DATABASE_URL="postgresql://user:password@localhost:5432/api_gateway?sslmode=disable"
 export REDIS_URL="localhost:6379"
-export KAFKA_BROKERS="localhost:9092"
-export PORT="8081"
-```
+export ORCHESTRATOR_GRPC_ADDR="localhost:50051"
 
-2. Run database migrations:
-```bash
-# Apply migrations from migrations/ directory
-```
-
-3. Start the service:
-```bash
 go run cmd/main.go
 ```
 
 ### Docker
 
-Build and run with Docker:
 ```bash
 docker build -t api-gateway .
 docker run -p 8081:8081 \
   -e DATABASE_URL="..." \
   -e REDIS_URL="..." \
-  -e KAFKA_BROKERS="..." \
+  -e ORCHESTRATOR_GRPC_ADDR="..." \
   api-gateway
 ```
 
-### Docker Compose
-
-Run as part of the complete system:
-```bash
-docker-compose up api-gateway
-```
-
-## Dependencies
-
-### External Services
-- **PostgreSQL**: Payment data persistence
-- **Redis**: Idempotency key caching
-- **Kafka**: Event streaming to downstream services
-- **Jaeger** (optional): Distributed tracing
-
-### Downstream Consumers
-- **Payment Orchestrator**: Consumes `payment.created` events
-- **Ledger Service**: Eventually receives payment state changes
-
-## Database Schema
-
-The service uses the following main table:
-
-```sql
-CREATE TABLE payments (
-    id VARCHAR(255) PRIMARY KEY,
-    amount DECIMAL(10,2) NOT NULL,
-    currency VARCHAR(3) NOT NULL,
-    customer_id VARCHAR(255) NOT NULL,
-    merchant_id VARCHAR(255) NOT NULL,
-    status VARCHAR(50) NOT NULL,
-    idempotency_key VARCHAR(255) UNIQUE,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-## Monitoring
-
-### Metrics
-Prometheus metrics are exposed at `/metrics` endpoint:
-- HTTP request duration histograms
-- Request count by status code
-- Active connections
-- Custom business metrics
-
-### Logging
-Structured logging with Zap:
-- JSON format for production
-- Trace ID correlation
-- Error stack traces
-- Request/response logging
-
-### Tracing
-OpenTelemetry traces include:
-- HTTP request spans
-- Database query spans
-- Redis operations
-- Kafka publish operations
-
 ## Error Handling
 
-The service returns standard HTTP status codes:
-- `200 OK`: Successful operation
-- `201 Created`: Payment successfully created
-- `400 Bad Request`: Invalid request payload
-- `404 Not Found`: Payment not found
-- `409 Conflict`: Idempotency key conflict
-- `500 Internal Server Error`: Server-side errors
+| Status | Meaning |
+|--------|---------|
+| `200 OK` | Successful operation |
+| `201 Created` | Payment created |
+| `400 Bad Request` | Invalid request payload |
+| `404 Not Found` | Payment not found |
+| `500 Internal Server Error` | Server-side error |
+| `503 Service Unavailable` | Circuit breaker open |
 
-## Development
+## Project Structure
 
-### Project Structure
 ```
 api-gateway/
 ├── cmd/
-│   └── main.go              # Application entry point
+│   └── main.go                    # Entry point
 ├── internal/
 │   ├── api/
-│   │   └── router.go        # Route definitions
+│   │   └── router.go              # Route definitions & middleware setup
+│   ├── circuitbreaker/
+│   │   └── orchestrator_client.go # gRPC client with circuit breaker & retry
 │   ├── config/
-│   │   └── config.go        # Configuration management
+│   │   └── config.go              # Configuration (env vars)
 │   ├── handlers/
-│   │   └── payment_handler.go  # HTTP handlers
+│   │   └── payment_handler.go     # HTTP handlers
 │   ├── interfaces/
 │   │   └── payment_repository.go  # Repository interface
 │   ├── middleware/
-│   │   └── idempotency.go   # Idempotency middleware
+│   │   └── idempotency.go         # Idempotency middleware
 │   ├── models/
-│   │   └── payment.go       # Domain models
+│   │   └── payment.go             # Domain models
 │   ├── repository/
-│   │   └── payment_repository.go  # Data access layer
+│   │   └── payment_repository.go  # PostgreSQL data access
 │   └── telemetry/
-│       └── telemetry.go     # Observability setup
+│       └── telemetry.go           # OpenTelemetry & Zap setup
 ├── migrations/
 │   └── 001_api_gateway_schema.sql
 ├── Dockerfile
 └── README.md
 ```
 
-### Running Tests
-```bash
-go test ./...
-```
-
 ## Graceful Shutdown
 
-The service supports graceful shutdown with a 5-second timeout:
-- Stops accepting new requests
-- Completes in-flight requests
-- Closes database connections
-- Flushes telemetry data
-- Closes Kafka writer
-
-## License
-
-Copyright © 2026
+The service shuts down gracefully with a 5-second timeout: stops accepting new requests, completes in-flight requests, closes database connections, flushes telemetry data, and syncs the logger.
