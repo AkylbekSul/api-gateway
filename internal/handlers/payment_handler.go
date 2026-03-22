@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -13,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/akylbek/payment-system/api-gateway/internal/circuitbreaker"
 	"github.com/akylbek/payment-system/api-gateway/internal/interfaces"
 	"github.com/akylbek/payment-system/api-gateway/internal/models"
 	"github.com/akylbek/payment-system/api-gateway/internal/telemetry"
@@ -20,12 +22,12 @@ import (
 )
 
 type PaymentHandler struct {
-	repo                interfaces.PaymentRepository
-	redisClient         *redis.Client
-	orchestratorClient  paymentpb.PaymentOrchestratorClient
+	repo               interfaces.PaymentRepository
+	redisClient        *redis.Client
+	orchestratorClient *circuitbreaker.OrchestratorClient
 }
 
-func NewPaymentHandler(repo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorClient paymentpb.PaymentOrchestratorClient) *PaymentHandler {
+func NewPaymentHandler(repo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorClient *circuitbreaker.OrchestratorClient) *PaymentHandler {
 	return &PaymentHandler{
 		repo:               repo,
 		redisClient:        redisClient,
@@ -90,7 +92,7 @@ func (h *PaymentHandler) CreatePayment(c *gin.Context) {
 		// Redis кэш не критичен, продолжаем
 	}
 
-	// Send to Payment Orchestrator via gRPC
+	// Send to Payment Orchestrator via gRPC (with circuit breaker + retry)
 	_, err = h.orchestratorClient.ProcessPayment(ctx, &paymentpb.ProcessPaymentRequest{
 		PaymentId:  payment.ID,
 		Amount:     payment.Amount,
@@ -105,7 +107,11 @@ func (h *PaymentHandler) CreatePayment(c *gin.Context) {
 			zap.String("payment_id", payment.ID),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
+		if strings.Contains(err.Error(), "circuit breaker open") {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Payment orchestrator is temporarily unavailable"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process payment"})
+		}
 		return
 	}
 
@@ -125,6 +131,10 @@ func (h *PaymentHandler) GetPayment(c *gin.Context) {
 		return
 	}
 	if err != nil {
+		telemetry.Logger.Error("Failed to fetch payment from database",
+			zap.String("payment_id", id),
+			zap.Error(err),
+		)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch payment"})
 		return
 	}
@@ -136,6 +146,10 @@ func (h *PaymentHandler) ConfirmPayment(c *gin.Context) {
 	id := c.Param("id")
 
 	if err := h.repo.UpdateStatus(c.Request.Context(), id, "CONFIRMED"); err != nil {
+		telemetry.Logger.Error("Failed to confirm payment",
+			zap.String("payment_id", id),
+			zap.Error(err),
+		)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to confirm payment"})
 		return
 	}

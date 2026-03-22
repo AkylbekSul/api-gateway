@@ -17,10 +17,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/akylbek/payment-system/api-gateway/internal/api"
+	"github.com/akylbek/payment-system/api-gateway/internal/circuitbreaker"
 	"github.com/akylbek/payment-system/api-gateway/internal/config"
 	"github.com/akylbek/payment-system/api-gateway/internal/repository"
 	"github.com/akylbek/payment-system/api-gateway/internal/telemetry"
-	paymentpb "github.com/akylbek/payment-system/proto/payment"
 )
 
 func main() {
@@ -59,7 +59,7 @@ func main() {
 		PoolSize: 100,
 	})
 
-	// Connect to Payment Orchestrator via gRPC
+	// Connect to Payment Orchestrator via gRPC with timeout
 	orchestratorConn, err := grpc.NewClient(cfg.OrchestratorGRPCAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
@@ -67,7 +67,9 @@ func main() {
 		telemetry.Logger.Fatal("Failed to connect to orchestrator via gRPC", zap.Error(err))
 	}
 	defer orchestratorConn.Close()
-	orchestratorClient := paymentpb.NewPaymentOrchestratorClient(orchestratorConn)
+
+	// Wrap gRPC client with circuit breaker, timeouts (5s per call), and retries (up to 3)
+	orchestratorClient := circuitbreaker.NewOrchestratorClient(orchestratorConn, 2*time.Second, 1)
 
 	// Setup router with all routes
 	router := api.NewRouter(paymentRepo, redisClient, orchestratorClient)

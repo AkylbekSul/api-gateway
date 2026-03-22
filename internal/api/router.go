@@ -7,14 +7,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/akylbek/payment-system/api-gateway/internal/circuitbreaker"
 	"github.com/akylbek/payment-system/api-gateway/internal/handlers"
 	"github.com/akylbek/payment-system/api-gateway/internal/interfaces"
 	"github.com/akylbek/payment-system/api-gateway/internal/middleware"
 	"github.com/akylbek/payment-system/api-gateway/internal/telemetry"
-	paymentpb "github.com/akylbek/payment-system/proto/payment"
 )
 
-func NewRouter(paymentRepo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorClient paymentpb.PaymentOrchestratorClient) *gin.Engine {
+func NewRouter(paymentRepo interfaces.PaymentRepository, redisClient *redis.Client, orchestratorClient *circuitbreaker.OrchestratorClient) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
